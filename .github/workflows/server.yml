@@ -1,0 +1,90 @@
+name: Sman WhatsApp Live Server
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'auth_info_baileys/**'
+  schedule:
+    - cron: '0 */5 * * *'
+
+permissions:
+  contents: write
+
+# حاسم جداً: إغلاق أي نسخة قديمة فوراً حتى لا تعمل نسختان معاً وتضرب التشفير
+concurrency:
+  group: sman-whatsapp-single-server
+  cancel-in-progress: true
+
+jobs:
+  run-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies & Tunnel
+        run: |
+          npm install --no-audit --no-fund
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+
+      - name: Start Server & Live Tunnel
+        run: |
+          git config user.name "sman-bot"
+          git config user.email "bot@sman.com"
+
+          # تشغيل النفق أولاً واستخراج الرابط
+          ./cloudflared tunnel --no-autoupdate --url http://localhost:8080 > tunnel.log 2>&1 &
+          sleep 8
+          echo "========================================="
+          echo "🌐 رابط السيرفر المباشر للـ CRM هو:"
+          grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' tunnel.log | head -n 1
+          echo "========================================="
+
+          # تشغيل سيرفر الواتساب مع إعادة تشغيله تلقائياً لو توقف لأي سبب
+          (while true; do node index.js; sleep 3; done) &
+
+          # حفظ آمن وسريع للجلسة فور نجاح الربط ثم متابعة الحفظ الدوري
+          SAVE_WT="/tmp/sman_save_wt"
+          SNAPSHOT="/tmp/sman_session_snap"
+
+          save_session_to_git() {
+            if [ -f "auth_info_baileys/creds.json" ] && grep -q '"registered":true' "auth_info_baileys/creds.json"; then
+              rm -rf "$SNAPSHOT" && mkdir -p "$SNAPSHOT"
+              cp -r auth_info_baileys/. "$SNAPSHOT/"
+              git fetch origin main || true
+              git worktree prune || true
+              rm -rf "$SAVE_WT"
+              if git worktree add --detach "$SAVE_WT" origin/main; then
+                mkdir -p "$SAVE_WT/auth_info_baileys"
+                cp -r "$SNAPSHOT/." "$SAVE_WT/auth_info_baileys/"
+                git -C "$SAVE_WT" add -A auth_info_baileys || true
+                if ! git -C "$SAVE_WT" diff --cached --quiet; then
+                  git -C "$SAVE_WT" commit -m "chore: update valid session" || true
+                  git -C "$SAVE_WT" push origin HEAD:main || true
+                  echo "💾 تم حفظ جلسة الواتساب بنجاح في GitHub!"
+                fi
+                git worktree remove --force "$SAVE_WT" || true
+              fi
+            fi
+          }
+
+          # فحص سريع كل 15 ثانية في أول 3 دقائق لحفظ الربط فور إدخال الكود على الهاتف
+          for j in {1..12}; do
+            sleep 15
+            save_session_to_git
+          done
+
+          # متابعة الحفظ الدوري كل 5 دقائق
+          for i in {1..64}; do
+            sleep 300
+            save_session_to_git
+          done
