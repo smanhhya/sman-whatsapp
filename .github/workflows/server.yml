@@ -34,8 +34,9 @@ jobs:
         env:
           WA_SESSION_B64: ${{ secrets.WA_SESSION_B64 }}
           WA_SESSION_B64_2: ${{ secrets.WA_SESSION_B64_2 }}
+          WA_SESSION_B64_3: ${{ secrets.WA_SESSION_B64_3 }}
         run: |
-          COMBINED_B64="${WA_SESSION_B64}${WA_SESSION_B64_2}"
+          COMBINED_B64="${WA_SESSION_B64}${WA_SESSION_B64_2}${WA_SESSION_B64_3}"
           if [ -n "$COMBINED_B64" ]; then
             rm -rf auth_info_baileys
             mkdir -p auth_info_baileys
@@ -48,22 +49,70 @@ jobs:
       - name: Start Server & Live Tunnel
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          FIREBASE_EMAIL: ${{ secrets.FIREBASE_EMAIL }}
+          FIREBASE_PASSWORD: ${{ secrets.FIREBASE_PASSWORD }}
         run: |
-          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-            ./cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > tunnel.log 2>&1 &
-            sleep 5
-            echo "========================================="
-            echo "🌐 تم تشغيل النفق الثابت (Cloudflare Fixed Tunnel) بنجاح!"
-            echo "🔗 السيرفر متصل الآن على رابطك الثابت في Cloudflare"
-            echo "========================================="
+          ./cloudflared tunnel --no-autoupdate --url http://localhost:8080 > tunnel.log 2>&1 &
+
+          TUNNEL_URL=""
+          for k in {1..15}; do
+            TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' tunnel.log | head -n 1)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "========================================="
+          echo "🌐 رابط السيرفر المباشر للـ CRM هو:"
+          echo "$TUNNEL_URL"
+          echo "========================================="
+
+          if [ -n "$TUNNEL_URL" ] && [ -n "$FIREBASE_EMAIL" ] && [ -n "$FIREBASE_PASSWORD" ]; then
+            TUNNEL_URL="$TUNNEL_URL" node -e '
+              (async () => {
+                try {
+                  const apiKey = "AIzaSyD7ZJP8n8fhMewPfEsTBANn0h9To_q15BY";
+                  const authRes = await fetch("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + apiKey, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      email: process.env.FIREBASE_EMAIL,
+                      password: process.env.FIREBASE_PASSWORD,
+                      returnSecureToken: true
+                    })
+                  });
+                  const authData = await authRes.json();
+                  if (!authData.idToken) {
+                    console.log("⚠️ فشل تسجيل الدخول إلى Firebase لتحديث الرابط:", authData.error?.message || "Unknown error");
+                    return;
+                  }
+                  const patchUrl = "https://firestore.googleapis.com/v1/projects/sman-ca8f8/databases/(default)/documents/inventory/settings?updateMask.fieldPaths=whatsappServerUrl";
+                  const fsRes = await fetch(patchUrl, {
+                    method: "PATCH",
+                    headers: {
+                      "Authorization": "Bearer " + authData.idToken,
+                      "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                      fields: {
+                        whatsappServerUrl: { stringValue: process.env.TUNNEL_URL }
+                      }
+                    })
+                  });
+                  if (fsRes.ok) {
+                    console.log("✅ تم إرسال وتحديث رابط السيرفر تلقائياً في قاعدة بيانات موقع سمان ههيا!");
+                  } else {
+                    const errTxt = await fsRes.text();
+                    console.log("⚠️ فشل تحديث الرابط في Firestore:", errTxt);
+                  }
+                } catch (err) {
+                  console.log("⚠️ خطأ أثناء مزامنة الرابط مع الموقع:", err.message);
+                }
+              })();
+            '
           else
-            ./cloudflared tunnel --no-autoupdate --url http://localhost:8080 > tunnel.log 2>&1 &
-            sleep 8
-            echo "========================================="
-            echo "🌐 رابط السيرفر المؤقت للـ CRM هو:"
-            grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' tunnel.log | head -n 1
-            echo "========================================="
+            echo "ℹ️ لم يتم ضبط FIREBASE_EMAIL أو FIREBASE_PASSWORD في Secrets، لن يتم التحديث التلقائي للرابط."
           fi
 
           (while true; do node index.js; sleep 3; done) &
@@ -77,11 +126,17 @@ jobs:
                 if [ "$FULL_B64" != "$LAST_SAVED_B64" ]; then
                   PART1="${FULL_B64:0:40000}"
                   PART2="${FULL_B64:40000:40000}"
+                  PART3="${FULL_B64:80000:40000}"
                   if printf "%s" "$PART1" | GH_TOKEN="$GH_PAT" gh secret set WA_SESSION_B64 --repo "${{ github.repository }}"; then
                     if [ -n "$PART2" ]; then
                       printf "%s" "$PART2" | GH_TOKEN="$GH_PAT" gh secret set WA_SESSION_B64_2 --repo "${{ github.repository }}" || true
                     else
                       GH_TOKEN="$GH_PAT" gh secret delete WA_SESSION_B64_2 --repo "${{ github.repository }}" 2>/dev/null || true
+                    fi
+                    if [ -n "$PART3" ]; then
+                      printf "%s" "$PART3" | GH_TOKEN="$GH_PAT" gh secret set WA_SESSION_B64_3 --repo "${{ github.repository }}" || true
+                    else
+                      GH_TOKEN="$GH_PAT" gh secret delete WA_SESSION_B64_3 --repo "${{ github.repository }}" 2>/dev/null || true
                     fi
                     LAST_SAVED_B64="$FULL_B64"
                     echo "🔐 تم حفظ جلسة الواتساب في خزنة GitHub المشفرة بأمان تام!"
