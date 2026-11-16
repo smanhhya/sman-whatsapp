@@ -8,7 +8,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  fetchLatestWaWebVersion,
+  makeCacheableSignalKeyStore,
   Browsers,
   delay
 } = require("@whiskeysockets/baileys");
@@ -34,11 +34,9 @@ let sock = null;
 let isConnected = false;
 let isConnecting = false;
 let isInitialStartup = true;
-let pairingMode = "code"; // "code" للربط بـ 8 أرقام | "qr" للربط بمسح الكود
 let currentPairingCode = null;
 let currentQrString = null;
 let pairingCodeGeneratedAt = 0;
-let lastDiagnosticMsg = "";
 let pairingRetryTimer = null;
 let reconnectTimer = null;
 let isSendingQueueRunning = false;
@@ -287,28 +285,6 @@ function scheduleReconnect(delayMs) {
   }, delayMs);
 }
 
-async function resolveLiveWhatsAppVersion() {
-  try {
-    if (typeof fetchLatestWaWebVersion === "function") {
-      const webVer = await fetchLatestWaWebVersion({});
-      if (webVer?.version && Array.isArray(webVer.version)) {
-        console.log("🌐 إصدار واتساب ويب المباشر:", webVer.version.join("."));
-        return webVer.version;
-      }
-    }
-  } catch (e) {}
-
-  try {
-    const fallbackVer = await fetchLatestBaileysVersion();
-    if (fallbackVer?.version && Array.isArray(fallbackVer.version)) {
-      console.log("🌐 إصدار واتساب الاحتياطي:", fallbackVer.version.join("."));
-      return fallbackVer.version;
-    }
-  } catch (e) {}
-
-  return [2, 3000, 1023223821];
-}
-
 async function requestPairingCodeSafely(targetSock) {
   if (pairingRetryTimer) {
     clearTimeout(pairingRetryTimer);
@@ -316,21 +292,18 @@ async function requestPairingCodeSafely(targetSock) {
   }
 
   try {
-    if (!targetSock || targetSock !== sock || targetSock.authState.creds.registered || pairingMode !== "code") {
+    if (!targetSock || targetSock !== sock || targetSock.authState.creds.registered) {
       return;
     }
     let code = await targetSock.requestPairingCode(PHONE_NUMBER);
     code = code?.match(/.{1,4}/g)?.join("-") || code;
     currentPairingCode = code;
-    currentQrString = null;
     pairingCodeGeneratedAt = Date.now();
-    lastDiagnosticMsg = "تم توليد كود الربط بنجاح. أدخله الآن في واتساب.";
     console.log("========================================");
     console.log("🔑 كود ربط الواتساب الجديد الخاص بك هو: ", code);
     console.log("📱 أدخل هذا الكود الآن في واتساب (رقم 01208027294) خلال دقيقة واحدة");
     console.log("========================================");
   } catch (err) {
-    lastDiagnosticMsg = "جاري إعادة طلب كود الربط: " + err.message;
     console.log("⚠️ جاري إعادة محاولة استخراج كود الربط خلال 5 ثوانٍ...", err.message);
     pairingRetryTimer = setTimeout(() => {
       requestPairingCodeSafely(targetSock);
@@ -360,7 +333,16 @@ async function connectToWhatsApp() {
     isInitialStartup = false;
 
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-    const version = await resolveLiveWhatsAppVersion();
+
+    let version = [2, 3000, 1020500000];
+    try {
+      const latest = await fetchLatestBaileysVersion();
+      if (latest?.version) {
+        version = latest.version;
+      }
+    } catch (e) {
+      console.log("⚠️ استخدام نسخة واتساب الاحتياطية للاتصال...");
+    }
 
     const currentSock = makeWASocket({
       version,
@@ -368,7 +350,7 @@ async function connectToWhatsApp() {
       printQRInTerminal: false,
       auth: {
         creds: state.creds,
-        keys: state.keys
+        keys: makeCacheableSignalKeyStore ? makeCacheableSignalKeyStore(state.keys, logger) : state.keys
       },
       browser: Browsers.macOS("Chrome"),
       syncFullHistory: false,
@@ -415,14 +397,10 @@ async function connectToWhatsApp() {
       if (currentSock !== sock) return;
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr && !currentSock.authState.creds.registered) {
-        if (pairingMode === "qr") {
-          currentQrString = qr;
-          currentPairingCode = null;
-          lastDiagnosticMsg = "رمز QR جاهز للمسح بكاميرا واتساب.";
-        } else if (pairingMode === "code" && !pairingStartedForThisSocket) {
+      if (qr) {
+        currentQrString = qr;
+        if (!currentSock.authState.creds.registered && !pairingStartedForThisSocket) {
           pairingStartedForThisSocket = true;
-          currentQrString = null;
           pairingRetryTimer = setTimeout(() => {
             requestPairingCodeSafely(currentSock);
           }, 1500);
@@ -438,14 +416,12 @@ async function connectToWhatsApp() {
         }
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const errMsg = lastDisconnect?.error?.message || "unknown";
-        lastDiagnosticMsg = `انقطع الاتصال المؤقت (كود: ${statusCode || "غير محدد"} - ${errMsg})`;
-        console.log(`⚠️ الاتصال فصل (كود: ${statusCode} - ${errMsg})`);
+        console.log(`⚠️ الاتصال فصل (كود: ${statusCode})`);
 
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405) {
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
           currentPairingCode = null;
           currentQrString = null;
-          console.log(`🧹 مسح الجلسة غير الصالحة (${statusCode}) وتجهيز ربط جديد...`);
+          console.log("🧹 تم تسجيل الخروج (401).. جاري مسح الجلسة القديمة وتوليد كود جديد...");
           try {
             fs.rmSync(SESSION_DIR, { recursive: true, force: true });
           } catch (e) {}
@@ -459,7 +435,6 @@ async function connectToWhatsApp() {
         isConnecting = false;
         currentPairingCode = null;
         currentQrString = null;
-        lastDiagnosticMsg = "متصل بنجاح!";
         if (pairingRetryTimer) {
           clearTimeout(pairingRetryTimer);
           pairingRetryTimer = null;
@@ -472,7 +447,6 @@ async function connectToWhatsApp() {
     });
   } catch (err) {
     isConnecting = false;
-    lastDiagnosticMsg = "خطأ تهيئة: " + err.message;
     console.log("⚠️ خطأ أثناء تهيئة الاتصال، إعادة المحاولة خلال 4 ثوانٍ...", err.message);
     scheduleReconnect(4000);
   }
@@ -560,26 +534,19 @@ app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
     connected: isConnected,
-    pairingMode,
     pairingCode: currentPairingCode,
     qrString: currentQrString,
     pairingCodeAgeSec: pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null,
-    diagnostic: lastDiagnosticMsg,
     queueLength: sendQueue.length,
     message: isConnected ? "Server is running & WhatsApp Connected!" : "Waiting for WhatsApp pairing..."
   });
 });
 
 app.post("/reset-pair", (req, res) => {
-  const requestedMode = req.body?.mode;
-  if (requestedMode === "qr" || requestedMode === "code") {
-    pairingMode = requestedMode;
-  }
   currentPairingCode = null;
   currentQrString = null;
   isConnected = false;
   isConnecting = false;
-  lastDiagnosticMsg = "جاري تهيئة اتصال جديد النظيف...";
   if (pairingRetryTimer) {
     clearTimeout(pairingRetryTimer);
     pairingRetryTimer = null;
@@ -599,10 +566,10 @@ app.post("/reset-pair", (req, res) => {
     fs.rmSync(SESSION_DIR, { recursive: true, force: true });
   } catch (e) {}
   scheduleReconnect(1000);
-  res.status(200).json({ ok: true, mode: pairingMode });
+  res.status(200).json({ ok: true });
 });
 
-// صفحة ربط مستقلة لكل وضع (إما كود 8 أرقام فقط أو QR Code فقط دون تعارض)
+// صفحة ربط مزدوجة (كود بالأرقام + مسح QR Code)
 app.get("/pair", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
@@ -619,9 +586,8 @@ app.get("/pair", (req, res) => {
   .qr-wrap { background: #ffffff; padding: 14px; border-radius: 16px; display: inline-block; margin: 12px auto; }
   button { background: #25D366; color: #052e16; border: none; padding: 13px 18px; border-radius: 14px; font-size: 15px; font-weight: 800; width: 100%; cursor: pointer; margin-bottom: 10px; }
   button.sec { background: #334155; color: #f8fafc; font-size: 13px; }
-  button.alt { background: #0284c7; color: #ffffff; font-size: 14px; }
   .sub { color: #94a3b8; font-size: 13px; line-height: 1.6; }
-  .diag { background: #0f172a; color: #fbbf24; font-size: 12px; padding: 8px 12px; border-radius: 10px; margin-top: 10px; }
+  .divider { border-top: 1px solid #334155; margin: 16px 0; padding-top: 12px; }
 </style>
 </head>
 <body>
@@ -630,90 +596,54 @@ app.get("/pair", (req, res) => {
   <div id="status" class="sub">جاري الاتصال بالسيرفر...</div>
   <div id="codeBox" class="code" style="display:none">----</div>
   <button id="copyBtn" style="display:none" onclick="copyCode()">📋 نسخ كود الربط (8 أرقام)</button>
-  <div id="qrSection" style="display:none">
+  <div id="qrSection" class="divider" style="display:none">
+    <div class="sub" style="color:#e2e8f0;font-weight:700">أو امسح رمز QR مباشرة بكاميرا واتساب:</div>
     <div class="qr-wrap"><div id="qrcode"></div></div>
   </div>
-  <button id="switchModeBtn" class="alt" onclick="switchMode()">📷 التبديل إلى الربط بـ QR Code</button>
-  <button id="resetBtn" class="sec" onclick="resetPair()">🔄 تصفير وتوليد كود جديد الآن</button>
-  <div id="diagBox" class="diag" style="display:none"></div>
-  <p class="sub" style="margin-top:10px">رقم الشغل: <b>01208027294</b> • يعمل كل وضع بشكل مستقل تماماً لمنع أي تعارض.</p>
+  <button id="resetBtn" class="sec" onclick="resetPair()">🔄 تصفير الجلسة وتوليد كود جديد الآن</button>
+  <p class="sub" style="margin-top:8px">رقم الشغل: <b>01208027294</b> • تأكد أن الوقت في الهاتف مضبوط على <b>تلقائي</b> وأن التطبيق رسمي وليس نسخة مكررة.</p>
 </div>
 <script>
   let latestCode = "";
   let lastQr = "";
-  let currentMode = "code";
   function copyCode() {
     if (!latestCode) return;
     navigator.clipboard.writeText(latestCode.replace(/-/g, ""));
     document.getElementById("copyBtn").innerText = "✅ تم النسخ! الصقه في واتساب الآن";
   }
-  async function resetPair(targetMode) {
-    document.getElementById("resetBtn").innerText = "⏳ جاري التهيئة النظيفة...";
+  async function resetPair() {
+    document.getElementById("resetBtn").innerText = "⏳ جاري التصفير...";
+    await fetch("/reset-pair", { method: "POST" });
     lastQr = "";
-    await fetch("/reset-pair", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: targetMode || currentMode })
-    });
-    document.getElementById("resetBtn").innerText = "🔄 تصفير وتوليد كود جديد الآن";
-  }
-  function switchMode() {
-    const nextMode = currentMode === "code" ? "qr" : "code";
-    resetPair(nextMode);
+    document.getElementById("resetBtn").innerText = "🔄 تصفير الجلسة وتوليد كود جديد الآن";
   }
   async function poll() {
     try {
       const r = await fetch("/");
       const d = await r.json();
-      currentMode = d.pairingMode || "code";
-      document.getElementById("switchModeBtn").innerText = currentMode === "code"
-        ? "📷 التبديل إلى الربط بـ QR Code"
-        : "🔢 التبديل إلى الربط بالكود (8 أرقام)";
-
-      if (d.diagnostic) {
-        const db = document.getElementById("diagBox");
-        db.style.display = "block";
-        db.innerText = d.diagnostic;
-      }
-
       if (d.connected) {
         document.getElementById("status").innerHTML = "<b style='color:#4ade80;font-size:18px'>✅ تم ربط الواتساب بنجاح والسيرفر متصل!</b>";
         document.getElementById("codeBox").style.display = "none";
         document.getElementById("copyBtn").style.display = "none";
         document.getElementById("qrSection").style.display = "none";
-        document.getElementById("switchModeBtn").style.display = "none";
         document.getElementById("resetBtn").style.display = "none";
         return;
       }
-
-      if (currentMode === "code") {
-        document.getElementById("qrSection").style.display = "none";
-        if (d.pairingCode) {
-          latestCode = d.pairingCode;
-          document.getElementById("status").innerText = "الكود جاهز (منذ " + (d.pairingCodeAgeSec || 0) + " ثانية):";
-          document.getElementById("codeBox").style.display = "block";
-          document.getElementById("codeBox").innerText = d.pairingCode;
-          document.getElementById("copyBtn").style.display = "block";
-        } else {
-          document.getElementById("codeBox").style.display = "none";
-          document.getElementById("copyBtn").style.display = "none";
-          document.getElementById("status").innerText = "⏳ جاري توليد كود الربط (8 أرقام)...";
-        }
+      if (d.pairingCode) {
+        latestCode = d.pairingCode;
+        document.getElementById("status").innerText = "الكود جاهز (منذ " + (d.pairingCodeAgeSec || 0) + " ثانية):";
+        document.getElementById("codeBox").style.display = "block";
+        document.getElementById("codeBox").innerText = d.pairingCode;
+        document.getElementById("copyBtn").style.display = "block";
       } else {
-        document.getElementById("codeBox").style.display = "none";
-        document.getElementById("copyBtn").style.display = "none";
-        if (d.qrString) {
-          document.getElementById("status").innerText = "امسح رمز QR التالي بكاميرا واتساب الآن:";
-          document.getElementById("qrSection").style.display = "block";
-          if (d.qrString !== lastQr && window.QRCode) {
-            lastQr = d.qrString;
-            const qrEl = document.getElementById("qrcode");
-            qrEl.innerHTML = "";
-            new QRCode(qrEl, { text: d.qrString, width: 220, height: 220 });
-          }
-        } else {
-          document.getElementById("status").innerText = "⏳ جاري توليد رمز QR النظيف...";
-        }
+        document.getElementById("status").innerText = "⏳ جاري توليد كود الربط...";
+      }
+      if (d.qrString && d.qrString !== lastQr && window.QRCode) {
+        lastQr = d.qrString;
+        document.getElementById("qrSection").style.display = "block";
+        const qrEl = document.getElementById("qrcode");
+        qrEl.innerHTML = "";
+        new QRCode(qrEl, { text: d.qrString, width: 210, height: 210 });
       }
     } catch (e) {}
   }
