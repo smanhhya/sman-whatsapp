@@ -8,6 +8,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   Browsers,
   delay
@@ -25,7 +26,8 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const SESSION_DIR = path.join(__dirname, "auth_info_baileys");
-const PHONE_NUMBER = "201208027294";
+const RESET_FLAG_FILE = path.join(__dirname, ".reset_wa_secret");
+const PHONE_NUMBER = "201280531968";
 const FIREBASE_API_KEY = "AIzaSyD7ZJP8n8fhMewPfEsTBANn0h9To_q15BY";
 const FIREBASE_PROJECT_ID = "sman-ca8f8";
 const logger = pino({ level: "silent" });
@@ -33,7 +35,7 @@ const logger = pino({ level: "silent" });
 let sock = null;
 let isConnected = false;
 let isConnecting = false;
-let isInitialStartup = true;
+let pairingMode = "code"; // "code" أو "qr" لمنع التعارض بينهما
 let currentPairingCode = null;
 let currentQrString = null;
 let pairingCodeGeneratedAt = 0;
@@ -44,9 +46,7 @@ let sentInBatchCounter = 0;
 let queueRestoredOnce = false;
 const sendQueue = [];
 
-// خزنة الرسائل لحل مشكلة "في انتظار هذه الرسالة" عند طلب إعادة التشفير
 const messageStore = new Map();
-// منع تكرار الرد الآلي على نفس المتصل خلال 24 ساعة
 const callAutoReplyCooldown = new Map();
 
 let cachedFbToken = null;
@@ -261,18 +261,27 @@ async function handleIncomingCallEvent(rawPhone, callSource = "phone_call") {
 }
 
 // === دوال اتصال الواتساب الأساسية ===
-function cleanCorruptedSessionIfNeeded() {
+function wipeSessionDirectory(markSecretReset = false) {
+  try {
+    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+    if (markSecretReset) {
+      fs.writeFileSync(RESET_FLAG_FILE, String(Date.now()));
+    }
+  } catch (e) {}
+}
+
+function cleanUnregisteredSessionBeforeStart() {
   const credsPath = path.join(SESSION_DIR, "creds.json");
   if (fs.existsSync(credsPath)) {
     try {
       const creds = JSON.parse(fs.readFileSync(credsPath, "utf-8"));
-      if (isInitialStartup && !creds.registered) {
-        console.log("🧹 مسح بقايا محاولة ربط قديمة غير مكتملة للبدء بمفاتيح جديدة...");
-        fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+      if (!creds.registered && !creds.me) {
+        console.log("🧹 تنظيف محاولة ربط سابقة غير مكتملة للبدء بمفاتيح تشفير جديدة...");
+        wipeSessionDirectory(false);
       }
     } catch (e) {
       console.log("🧹 مسح ملف جلسة تالف للبدء على نظافة...");
-      fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+      wipeSessionDirectory(false);
     }
   }
 }
@@ -285,6 +294,20 @@ function scheduleReconnect(delayMs) {
   }, delayMs);
 }
 
+async function resolveLatestWaVersion() {
+  try {
+    if (typeof fetchLatestWaWebVersion === "function") {
+      const waWeb = await fetchLatestWaWebVersion({});
+      if (waWeb?.version) return waWeb.version;
+    }
+  } catch (e) {}
+  try {
+    const latest = await fetchLatestBaileysVersion();
+    if (latest?.version) return latest.version;
+  } catch (e) {}
+  return [2, 3000, 1020500000];
+}
+
 async function requestPairingCodeSafely(targetSock) {
   if (pairingRetryTimer) {
     clearTimeout(pairingRetryTimer);
@@ -292,22 +315,20 @@ async function requestPairingCodeSafely(targetSock) {
   }
 
   try {
-    if (!targetSock || targetSock !== sock || targetSock.authState.creds.registered) {
+    if (!targetSock || targetSock !== sock || targetSock.authState.creds.registered || pairingMode !== "code") {
       return;
     }
     let code = await targetSock.requestPairingCode(PHONE_NUMBER);
     code = code?.match(/.{1,4}/g)?.join("-") || code;
     currentPairingCode = code;
+    currentQrString = null;
     pairingCodeGeneratedAt = Date.now();
     console.log("========================================");
     console.log("🔑 كود ربط الواتساب الجديد الخاص بك هو: ", code);
-    console.log("📱 أدخل هذا الكود الآن في واتساب (رقم 01208027294) خلال دقيقة واحدة");
+    console.log("📱 أدخل هذا الكود الآن في واتساب (رقم 01280531968)");
     console.log("========================================");
   } catch (err) {
-    console.log("⚠️ جاري إعادة محاولة استخراج كود الربط خلال 5 ثوانٍ...", err.message);
-    pairingRetryTimer = setTimeout(() => {
-      requestPairingCodeSafely(targetSock);
-    }, 5000);
+    console.log("⚠️ لم ينجح استخراج الكود في هذه المحاولة:", err.message);
   }
 }
 
@@ -329,20 +350,11 @@ async function connectToWhatsApp() {
   }
 
   try {
-    cleanCorruptedSessionIfNeeded();
-    isInitialStartup = false;
+    cleanUnregisteredSessionBeforeStart();
 
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-
-    let version = [2, 3000, 1020500000];
-    try {
-      const latest = await fetchLatestBaileysVersion();
-      if (latest?.version) {
-        version = latest.version;
-      }
-    } catch (e) {
-      console.log("⚠️ استخدام نسخة واتساب الاحتياطية للاتصال...");
-    }
+    const version = await resolveLatestWaVersion();
+    console.log("📡 جاري الاتصال بسيرفر واتساب باستخدام الإصدار:", version.join("."));
 
     const currentSock = makeWASocket({
       version,
@@ -352,10 +364,10 @@ async function connectToWhatsApp() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore ? makeCacheableSignalKeyStore(state.keys, logger) : state.keys
       },
-      browser: Browsers.macOS("Chrome"),
+      browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
@@ -397,13 +409,17 @@ async function connectToWhatsApp() {
       if (currentSock !== sock) return;
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr) {
-        currentQrString = qr;
-        if (!currentSock.authState.creds.registered && !pairingStartedForThisSocket) {
+      if (qr && !currentSock.authState.creds.registered) {
+        if (pairingMode === "qr") {
+          currentQrString = qr;
+          currentPairingCode = null;
+          console.log("📷 تم توليد رمز QR جديد، امسحه الآن من صفحة /pair");
+        } else if (pairingMode === "code" && !pairingStartedForThisSocket) {
           pairingStartedForThisSocket = true;
+          currentQrString = null;
           pairingRetryTimer = setTimeout(() => {
             requestPairingCodeSafely(currentSock);
-          }, 1500);
+          }, 2500);
         }
       }
 
@@ -418,23 +434,39 @@ async function connectToWhatsApp() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`⚠️ الاتصال فصل (كود: ${statusCode})`);
 
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        const fatalStatuses = [
+          DisconnectReason.loggedOut,
+          DisconnectReason.badSession,
+          DisconnectReason.forbidden,
+          DisconnectReason.multideviceMismatch,
+          401, 403, 405, 411, 500
+        ];
+
+        if (fatalStatuses.includes(statusCode)) {
           currentPairingCode = null;
           currentQrString = null;
-          console.log("🧹 تم تسجيل الخروج (401).. جاري مسح الجلسة القديمة وتوليد كود جديد...");
-          try {
-            fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-          } catch (e) {}
+          console.log(`🧹 جلسة غير صالحة (${statusCode}).. جاري مسح الجلسة القديمة وتوليد مفاتيح جديدة...`);
+          wipeSessionDirectory(true);
           scheduleReconnect(3000);
+        } else if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+          console.log("🔄 إتمام المصافحة (515).. جاري إعادة الاتصال الفوري لتثبيت الجلسة...");
+          scheduleReconnect(1000);
         } else {
-          const delayMs = statusCode === DisconnectReason.restartRequired ? 1000 : 2500;
-          scheduleReconnect(delayMs);
+          if (!currentSock.authState?.creds?.registered && !currentSock.authState?.creds?.me) {
+            currentPairingCode = null;
+            currentQrString = null;
+            wipeSessionDirectory(false);
+          }
+          scheduleReconnect(3000);
         }
       } else if (connection === "open") {
         isConnected = true;
         isConnecting = false;
         currentPairingCode = null;
         currentQrString = null;
+        try {
+          if (fs.existsSync(RESET_FLAG_FILE)) fs.unlinkSync(RESET_FLAG_FILE);
+        } catch (e) {}
         if (pairingRetryTimer) {
           clearTimeout(pairingRetryTimer);
           pairingRetryTimer = null;
@@ -485,7 +517,6 @@ async function sendSafeWhatsAppMessage(rawPhone, textMessage) {
   return cleanPhone;
 }
 
-// مشغل طابور الإرسال المتسلسل بفواصل زمنية بشرية آمنة وحفظ سحابي مستمر
 async function processSendQueue() {
   if (isSendingQueueRunning) return;
   isSendingQueueRunning = true;
@@ -534,6 +565,7 @@ app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
     connected: isConnected,
+    mode: pairingMode,
     pairingCode: currentPairingCode,
     qrString: currentQrString,
     pairingCodeAgeSec: pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null,
@@ -543,6 +575,9 @@ app.get("/", (req, res) => {
 });
 
 app.post("/reset-pair", (req, res) => {
+  if (req.body?.mode === "qr" || req.body?.mode === "code") {
+    pairingMode = req.body.mode;
+  }
   currentPairingCode = null;
   currentQrString = null;
   isConnected = false;
@@ -562,14 +597,11 @@ app.post("/reset-pair", (req, res) => {
     } catch (e) {}
     sock = null;
   }
-  try {
-    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-  } catch (e) {}
+  wipeSessionDirectory(true);
   scheduleReconnect(1000);
-  res.status(200).json({ ok: true });
+  res.status(200).json({ ok: true, mode: pairingMode });
 });
 
-// صفحة ربط مزدوجة (كود بالأرقام + مسح QR Code)
 app.get("/pair", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
@@ -582,73 +614,121 @@ app.get("/pair", (req, res) => {
 <style>
   body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 16px; }
   .card { background: #1e293b; border: 1px solid #334155; border-radius: 24px; padding: 24px 20px; max-width: 420px; width: 100%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tab { flex: 1; background: #0f172a; color: #94a3b8; border: 1px solid #334155; padding: 10px; border-radius: 12px; font-weight: 700; cursor: pointer; font-size: 13px; }
+  .tab.active { background: #25D366; color: #052e16; border-color: #25D366; }
   .code { font-size: 32px; font-weight: 900; letter-spacing: 3px; background: #0f172a; color: #4ade80; padding: 14px; border-radius: 16px; border: 2px dashed #22c55e; margin: 14px 0; direction: ltr; }
   .qr-wrap { background: #ffffff; padding: 14px; border-radius: 16px; display: inline-block; margin: 12px auto; }
-  button { background: #25D366; color: #052e16; border: none; padding: 13px 18px; border-radius: 14px; font-size: 15px; font-weight: 800; width: 100%; cursor: pointer; margin-bottom: 10px; }
-  button.sec { background: #334155; color: #f8fafc; font-size: 13px; }
+  button.action { background: #25D366; color: #052e16; border: none; padding: 13px 18px; border-radius: 14px; font-size: 15px; font-weight: 800; width: 100%; cursor: pointer; margin-bottom: 10px; }
+  button.sec { background: #334155; color: #f8fafc; font-size: 13px; border: none; padding: 12px; border-radius: 14px; width: 100%; cursor: pointer; font-weight: 700; }
   .sub { color: #94a3b8; font-size: 13px; line-height: 1.6; }
-  .divider { border-top: 1px solid #334155; margin: 16px 0; padding-top: 12px; }
 </style>
 </head>
 <body>
 <div class="card">
   <h2 style="margin-top:0">📱 ربط واتساب سمان ههيا</h2>
+  <div id="tabsBox" class="tabs">
+    <button id="tabCode" class="tab active" onclick="switchMode('code')">🔢 كود 8 أرقام</button>
+    <button id="tabQr" class="tab" onclick="switchMode('qr')">📷 مسح QR Code</button>
+  </div>
   <div id="status" class="sub">جاري الاتصال بالسيرفر...</div>
   <div id="codeBox" class="code" style="display:none">----</div>
-  <button id="copyBtn" style="display:none" onclick="copyCode()">📋 نسخ كود الربط (8 أرقام)</button>
-  <div id="qrSection" class="divider" style="display:none">
-    <div class="sub" style="color:#e2e8f0;font-weight:700">أو امسح رمز QR مباشرة بكاميرا واتساب:</div>
+  <button id="copyBtn" class="action" style="display:none" onclick="copyCode()">📋 نسخ كود الربط (8 أرقام)</button>
+  <div id="qrSection" style="display:none">
     <div class="qr-wrap"><div id="qrcode"></div></div>
   </div>
-  <button id="resetBtn" class="sec" onclick="resetPair()">🔄 تصفير الجلسة وتوليد كود جديد الآن</button>
-  <p class="sub" style="margin-top:8px">رقم الشغل: <b>01208027294</b> • تأكد أن الوقت في الهاتف مضبوط على <b>تلقائي</b> وأن التطبيق رسمي وليس نسخة مكررة.</p>
+  <button id="resetBtn" class="sec" onclick="resetPair()">🔄 تصفير الجلسة وتوليد ربط جديد الآن</button>
+  <p class="sub" style="margin-top:10px">رقم الشغل: <b>01280531968</b> • اختر إما كود الأرقام أو مسح الـ QR (بدون الجمع بينهما في نفس اللحظة لضمان نجاح الربط).</p>
 </div>
 <script>
   let latestCode = "";
   let lastQr = "";
+  let currentMode = "code";
+
   function copyCode() {
     if (!latestCode) return;
     navigator.clipboard.writeText(latestCode.replace(/-/g, ""));
     document.getElementById("copyBtn").innerText = "✅ تم النسخ! الصقه في واتساب الآن";
   }
+
+  async function switchMode(newMode) {
+    currentMode = newMode;
+    document.getElementById("tabCode").className = "tab" + (newMode === "code" ? " active" : "");
+    document.getElementById("tabQr").className = "tab" + (newMode === "qr" ? " active" : "");
+    document.getElementById("status").innerText = "⏳ جاري التبديل وتجهيز الجلسة...";
+    document.getElementById("codeBox").style.display = "none";
+    document.getElementById("copyBtn").style.display = "none";
+    document.getElementById("qrSection").style.display = "none";
+    lastQr = "";
+    await fetch("/reset-pair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: newMode })
+    });
+  }
+
   async function resetPair() {
     document.getElementById("resetBtn").innerText = "⏳ جاري التصفير...";
-    await fetch("/reset-pair", { method: "POST" });
     lastQr = "";
-    document.getElementById("resetBtn").innerText = "🔄 تصفير الجلسة وتوليد كود جديد الآن";
+    await fetch("/reset-pair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: currentMode })
+    });
+    document.getElementById("resetBtn").innerText = "🔄 تصفير الجلسة وتوليد ربط جديد الآن";
   }
+
   async function poll() {
     try {
       const r = await fetch("/");
       const d = await r.json();
       if (d.connected) {
         document.getElementById("status").innerHTML = "<b style='color:#4ade80;font-size:18px'>✅ تم ربط الواتساب بنجاح والسيرفر متصل!</b>";
+        document.getElementById("tabsBox").style.display = "none";
         document.getElementById("codeBox").style.display = "none";
         document.getElementById("copyBtn").style.display = "none";
         document.getElementById("qrSection").style.display = "none";
         document.getElementById("resetBtn").style.display = "none";
         return;
       }
-      if (d.pairingCode) {
-        latestCode = d.pairingCode;
-        document.getElementById("status").innerText = "الكود جاهز (منذ " + (d.pairingCodeAgeSec || 0) + " ثانية):";
-        document.getElementById("codeBox").style.display = "block";
-        document.getElementById("codeBox").innerText = d.pairingCode;
-        document.getElementById("copyBtn").style.display = "block";
+
+      currentMode = d.mode || "code";
+      document.getElementById("tabCode").className = "tab" + (currentMode === "code" ? " active" : "");
+      document.getElementById("tabQr").className = "tab" + (currentMode === "qr" ? " active" : "");
+
+      if (currentMode === "code") {
+        document.getElementById("qrSection").style.display = "none";
+        if (d.pairingCode) {
+          latestCode = d.pairingCode;
+          document.getElementById("status").innerText = "الكود جاهز (منذ " + (d.pairingCodeAgeSec || 0) + " ثانية):";
+          document.getElementById("codeBox").style.display = "block";
+          document.getElementById("codeBox").innerText = d.pairingCode;
+          document.getElementById("copyBtn").style.display = "block";
+        } else {
+          document.getElementById("codeBox").style.display = "none";
+          document.getElementById("copyBtn").style.display = "none";
+          document.getElementById("status").innerText = "⏳ جاري توليد كود الـ 8 أرقام...";
+        }
       } else {
-        document.getElementById("status").innerText = "⏳ جاري توليد كود الربط...";
-      }
-      if (d.qrString && d.qrString !== lastQr && window.QRCode) {
-        lastQr = d.qrString;
-        document.getElementById("qrSection").style.display = "block";
-        const qrEl = document.getElementById("qrcode");
-        qrEl.innerHTML = "";
-        new QRCode(qrEl, { text: d.qrString, width: 210, height: 210 });
+        document.getElementById("codeBox").style.display = "none";
+        document.getElementById("copyBtn").style.display = "none";
+        if (d.qrString && window.QRCode) {
+          document.getElementById("status").innerText = "امسح رمز الـ QR الآن من تطبيق واتساب:";
+          document.getElementById("qrSection").style.display = "block";
+          if (d.qrString !== lastQr) {
+            lastQr = d.qrString;
+            const qrEl = document.getElementById("qrcode");
+            qrEl.innerHTML = "";
+            new QRCode(qrEl, { text: d.qrString, width: 210, height: 210 });
+          }
+        } else {
+          document.getElementById("status").innerText = "⏳ جاري توليد رمز الـ QR...";
+        }
       }
     } catch (e) {}
   }
   poll();
-  setInterval(poll, 3000);
+  setInterval(poll, 2500);
 </script>
 </body>
 </html>`);
