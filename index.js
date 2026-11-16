@@ -35,6 +35,7 @@ let isConnected = false;
 let isConnecting = false;
 let isInitialStartup = true;
 let currentPairingCode = null;
+let pairingCodeGeneratedAt = 0;
 let pairingRetryTimer = null;
 let reconnectTimer = null;
 let isSendingQueueRunning = false;
@@ -190,7 +191,6 @@ async function handleIncomingCallEvent(rawPhone, callSource = "phone_call") {
   let isRegistered = false;
 
   try {
-    // 1. البحث عن العميل في أرشيف العملاء
     const custUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/customers/${localPhone}`;
     const custRes = await fetch(custUrl, { headers: { "Authorization": "Bearer " + token } });
     if (custRes.ok) {
@@ -202,7 +202,6 @@ async function handleIncomingCallEvent(rawPhone, callSource = "phone_call") {
       if (customerName) isRegistered = true;
     }
 
-    // 2. قراءة إعدادات الرد الآلي على المكالمات من inventory/settings
     const settingsUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/inventory/settings`;
     const setRes = await fetch(settingsUrl, { headers: { "Authorization": "Bearer " + token } });
     let autoReplyEnabled = false;
@@ -217,7 +216,6 @@ async function handleIncomingCallEvent(rawPhone, callSource = "phone_call") {
       if (sf.autoReplyNewTemplate?.stringValue) newTpl = sf.autoReplyNewTemplate.stringValue;
     }
 
-    // 3. إرسال الرد الآلي الذكي (بحد أقصى مرة كل 24 ساعة لنفس الرقم)
     let autoReplied = false;
     const lastReplyTs = callAutoReplyCooldown.get(localPhone) || 0;
     const isWithin24h = (Date.now() - lastReplyTs) < 24 * 60 * 60 * 1000;
@@ -233,7 +231,6 @@ async function handleIncomingCallEvent(rawPhone, callSource = "phone_call") {
       autoReplied = true;
     }
 
-    // 4. تسجيل المكالمة في سجل المكالمات wa_call_logs
     const logCreateUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/wa_call_logs`;
     await fetch(logCreateUrl, {
       method: "POST",
@@ -300,6 +297,7 @@ async function requestPairingCodeSafely(targetSock) {
     let code = await targetSock.requestPairingCode(PHONE_NUMBER);
     code = code?.match(/.{1,4}/g)?.join("-") || code;
     currentPairingCode = code;
+    pairingCodeGeneratedAt = Date.now();
     console.log("========================================");
     console.log("🔑 كود ربط الواتساب الجديد الخاص بك هو: ", code);
     console.log("📱 أدخل هذا الكود الآن في واتساب (رقم 01208027294) خلال دقيقة واحدة");
@@ -353,7 +351,7 @@ async function connectToWhatsApp() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore ? makeCacheableSignalKeyStore(state.keys, logger) : state.keys
       },
-      browser: Browsers.macOS("Chrome"),
+      browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
       markOnlineOnConnect: true,
@@ -373,7 +371,6 @@ async function connectToWhatsApp() {
 
     currentSock.ev.on("creds.update", saveCreds);
 
-    // حفظ أي رسالة صادرة في الذاكرة لتلبية طلبات فك التشفير من هواتف العملاء
     currentSock.ev.on("messages.upsert", ({ messages }) => {
       for (const m of messages) {
         if (m.key?.id && m.message) {
@@ -386,7 +383,6 @@ async function connectToWhatsApp() {
       }
     });
 
-    // التقاط مكالمات الواتساب الواردة تلقائياً
     currentSock.ev.on("call", async (calls) => {
       for (const c of calls) {
         if (c.status === "offer" && c.from && !c.from.includes("@lid")) {
@@ -404,7 +400,7 @@ async function connectToWhatsApp() {
         pairingStartedForThisSocket = true;
         pairingRetryTimer = setTimeout(() => {
           requestPairingCodeSafely(currentSock);
-        }, 1500);
+        }, 2000);
       }
 
       if (connection === "close") {
@@ -426,7 +422,9 @@ async function connectToWhatsApp() {
           } catch (e) {}
           scheduleReconnect(3000);
         } else {
-          scheduleReconnect(2000);
+          // في حالة إعادة التشغيل الإلزامي 515 بعد إدخال كود الربط، نعيد الاتصال فوراً لإتمام التشفير
+          const delayMs = statusCode === DisconnectReason.restartRequired ? 1000 : 2500;
+          scheduleReconnect(delayMs);
         }
       } else if (connection === "open") {
         isConnected = true;
@@ -532,9 +530,68 @@ app.get("/", (req, res) => {
     ok: true,
     connected: isConnected,
     pairingCode: currentPairingCode,
+    pairingCodeAgeSec: pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null,
     queueLength: sendQueue.length,
     message: isConnected ? "Server is running & WhatsApp Connected!" : "Waiting for WhatsApp pairing..."
   });
+});
+
+// صفحة ربط سريعة للموبايل تعرض الكود الحي وتحدّثه تلقائياً كل 3 ثوانٍ
+app.get("/pair", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ربط واتساب سمان ههيا</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 16px; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 24px; padding: 28px 22px; max-width: 400px; width: 100%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }
+  .code { font-size: 34px; font-weight: 900; letter-spacing: 3px; background: #0f172a; color: #4ade80; padding: 16px; border-radius: 16px; border: 2px dashed #22c55e; margin: 18px 0; direction: ltr; }
+  button { background: #25D366; color: #052e16; border: none; padding: 14px 20px; border-radius: 14px; font-size: 16px; font-weight: 800; width: 100%; cursor: pointer; }
+  .sub { color: #94a3b8; font-size: 13px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2 style="margin-top:0">📱 ربط واتساب سمان ههيا</h2>
+  <div id="status" class="sub">جاري جلب حالة السيرفر...</div>
+  <div id="codeBox" class="code" style="display:none">----</div>
+  <button id="copyBtn" style="display:none" onclick="copyCode()">📋 نسخ كود الربط الآن</button>
+  <p class="sub" style="margin-top:16px">افتح واتساب على رقم <b>01208027294</b> ← الأجهزة المرتبطة ← ربط جهاز ← الربط برقم الهاتف بدلًا من ذلك ← الصق الكود فورًا.</p>
+</div>
+<script>
+  let latestCode = "";
+  function copyCode() {
+    if (!latestCode) return;
+    navigator.clipboard.writeText(latestCode.replace(/-/g, ""));
+    document.getElementById("copyBtn").innerText = "✅ تم النسخ! الصقه في واتساب الآن";
+  }
+  async function poll() {
+    try {
+      const r = await fetch("/");
+      const d = await r.json();
+      if (d.connected) {
+        document.getElementById("status").innerHTML = "<b style='color:#4ade80;font-size:18px'>✅ تم ربط الواتساب بنجاح والسيرفر متصل!</b>";
+        document.getElementById("codeBox").style.display = "none";
+        document.getElementById("copyBtn").style.display = "none";
+      } else if (d.pairingCode) {
+        latestCode = d.pairingCode;
+        document.getElementById("status").innerText = "الكود جاهز (منذ " + (d.pairingCodeAgeSec || 0) + " ثانية):";
+        document.getElementById("codeBox").style.display = "block";
+        document.getElementById("codeBox").innerText = d.pairingCode;
+        document.getElementById("copyBtn").style.display = "block";
+      } else {
+        document.getElementById("status").innerText = "⏳ جاري توليد كود جديد من خوادم واتساب...";
+      }
+    } catch (e) {}
+  }
+  poll();
+  setInterval(poll, 3000);
+</script>
+</body>
+</html>`);
 });
 
 app.post("/send-bulk-smart", async (req, res) => {
@@ -577,7 +634,6 @@ app.post("/send-bulk", async (req, res) => {
   processSendQueue();
 });
 
-// مسار استقبال إشعارات المكالمات الواردة من تطبيق الهاتف (مثل MacroDroid)
 app.all("/incoming-call", async (req, res) => {
   const rawPhone = req.body?.phone || req.query?.phone;
   if (!rawPhone) {
