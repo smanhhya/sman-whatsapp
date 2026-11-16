@@ -27,7 +27,7 @@ app.use(express.json({ limit: "10mb" }));
 
 const SESSION_DIR = path.join(__dirname, "auth_info_baileys");
 const RESET_FLAG_FILE = path.join(__dirname, ".reset_wa_secret");
-const PHONE_NUMBER = "201280531968";
+const PHONE_NUMBER = "201208027294";
 const FIREBASE_API_KEY = "AIzaSyD7ZJP8n8fhMewPfEsTBANn0h9To_q15BY";
 const FIREBASE_PROJECT_ID = "sman-ca8f8";
 const logger = pino({ level: "silent" });
@@ -275,6 +275,7 @@ function cleanUnregisteredSessionBeforeStart() {
   if (fs.existsSync(credsPath)) {
     try {
       const creds = JSON.parse(fs.readFileSync(credsPath, "utf-8"));
+      // إذا لم تكتمل عملية الربط ولم يتم تعيين هوية الحساب بعد، نبدأ بمفاتيح نظيفة تماماً
       if (!creds.registered && !creds.me) {
         console.log("🧹 تنظيف محاولة ربط سابقة غير مكتملة للبدء بمفاتيح تشفير جديدة...");
         wipeSessionDirectory(false);
@@ -325,7 +326,7 @@ async function requestPairingCodeSafely(targetSock) {
     pairingCodeGeneratedAt = Date.now();
     console.log("========================================");
     console.log("🔑 كود ربط الواتساب الجديد الخاص بك هو: ", code);
-    console.log("📱 أدخل هذا الكود الآن في واتساب (رقم 01280531968)");
+    console.log("📱 أدخل هذا الكود الآن في واتساب (رقم 01208027294)");
     console.log("========================================");
   } catch (err) {
     console.log("⚠️ لم ينجح استخراج الكود في هذه المحاولة:", err.message);
@@ -367,7 +368,7 @@ async function connectToWhatsApp() {
       browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      markOnlineOnConnect: false,
+      markOnlineOnConnect: false, // مهم جداً لإتمام عملية الربط بدون فصل
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
@@ -452,6 +453,7 @@ async function connectToWhatsApp() {
           console.log("🔄 إتمام المصافحة (515).. جاري إعادة الاتصال الفوري لتثبيت الجلسة...");
           scheduleReconnect(1000);
         } else {
+          // إذا لم يتم الربط بعد وانتهت مهلة المحاولة (408)، ننظف المجلد لبدء كود جديد نظيف
           if (!currentSock.authState?.creds?.registered && !currentSock.authState?.creds?.me) {
             currentPairingCode = null;
             currentQrString = null;
@@ -638,7 +640,7 @@ app.get("/pair", (req, res) => {
     <div class="qr-wrap"><div id="qrcode"></div></div>
   </div>
   <button id="resetBtn" class="sec" onclick="resetPair()">🔄 تصفير الجلسة وتوليد ربط جديد الآن</button>
-  <p class="sub" style="margin-top:10px">رقم الشغل: <b>01280531968</b> • اختر إما كود الأرقام أو مسح الـ QR (بدون الجمع بينهما في نفس اللحظة لضمان نجاح الربط).</p>
+  <p class="sub" style="margin-top:10px">رقم الشغل: <b>01208027294</b> • اختر إما كود الأرقام أو مسح الـ QR (بدون الجمع بينهما في نفس اللحظة لضمان نجاح الربط).</p>
 </div>
 <script>
   let latestCode = "";
