@@ -1,4 +1,3 @@
-
 name: Sman WhatsApp Live Server
 
 on:
@@ -36,13 +35,20 @@ jobs:
           WA_SESSION_B64: ${{ secrets.WA_SESSION_B64 }}
           WA_SESSION_B64_2: ${{ secrets.WA_SESSION_B64_2 }}
           WA_SESSION_B64_3: ${{ secrets.WA_SESSION_B64_3 }}
+          WA_SESSION_B64_4: ${{ secrets.WA_SESSION_B64_4 }}
+          WA_SESSION_B64_5: ${{ secrets.WA_SESSION_B64_5 }}
+          WA_SESSION_B64_6: ${{ secrets.WA_SESSION_B64_6 }}
         run: |
-          COMBINED_B64="${WA_SESSION_B64}${WA_SESSION_B64_2}${WA_SESSION_B64_3}"
+          COMBINED_B64="${WA_SESSION_B64}${WA_SESSION_B64_2}${WA_SESSION_B64_3}${WA_SESSION_B64_4}${WA_SESSION_B64_5}${WA_SESSION_B64_6}"
           if [ -n "$COMBINED_B64" ]; then
             rm -rf auth_info_baileys
             mkdir -p auth_info_baileys
-            printf "%s" "$COMBINED_B64" | base64 -d | tar -xzf - -C auth_info_baileys
-            echo "✅ تم استرجاع جلسة الواتساب المشفرة بنجاح!"
+            if printf "%s" "$COMBINED_B64" | base64 -d | tar -xzf - -C auth_info_baileys 2>/dev/null; then
+              echo "✅ تم استرجاع جلسة الواتساب المشفرة بنجاح!"
+            else
+              echo "⚠️ الجلسة المحفوظة غير مكتملة، سيتم تنظيفها وبدء ربط جديد بأمان..."
+              rm -rf auth_info_baileys
+            fi
           else
             echo "ℹ️ لا توجد جلسة مشفرة محفوظة بعد، سيتم توليد كود ربط جديد."
           fi
@@ -123,22 +129,27 @@ jobs:
           save_session_to_secret() {
             if [ -f "auth_info_baileys/creds.json" ] && grep -q '"registered":true' "auth_info_baileys/creds.json"; then
               if [ -n "$GH_PAT" ]; then
+                ls -1t auth_info_baileys/pre-key-*.json 2>/dev/null | tail -n +121 | xargs -r rm -f || true
                 FULL_B64=$(tar -czf - -C auth_info_baileys . | base64 -w 0)
                 if [ "$FULL_B64" != "$LAST_SAVED_B64" ]; then
                   PART1="${FULL_B64:0:40000}"
                   PART2="${FULL_B64:40000:40000}"
                   PART3="${FULL_B64:80000:40000}"
+                  PART4="${FULL_B64:120000:40000}"
+                  PART5="${FULL_B64:160000:40000}"
+                  PART6="${FULL_B64:200000:40000}"
+
                   if printf "%s" "$PART1" | GH_TOKEN="$GH_PAT" gh secret set WA_SESSION_B64 --repo "${{ github.repository }}"; then
-                    if [ -n "$PART2" ]; then
-                      printf "%s" "$PART2" | GH_TOKEN="$GH_PAT" gh secret set WA_SESSION_B64_2 --repo "${{ github.repository }}" || true
-                    else
-                      GH_TOKEN="$GH_PAT" gh secret delete WA_SESSION_B64_2 --repo "${{ github.repository }}" 2>/dev/null || true
-                    fi
-                    if [ -n "$PART3" ]; then
-                      printf "%s" "$PART3" | GH_TOKEN="$GH_PAT" gh secret set WA_SESSION_B64_3 --repo "${{ github.repository }}" || true
-                    else
-                      GH_TOKEN="$GH_PAT" gh secret delete WA_SESSION_B64_3 --repo "${{ github.repository }}" 2>/dev/null || true
-                    fi
+                    for idx in 2 3 4 5 6; do
+                      VAR_NAME="PART${idx}"
+                      SECRET_NAME="WA_SESSION_B64_${idx}"
+                      VAL="${!VAR_NAME}"
+                      if [ -n "$VAL" ]; then
+                        printf "%s" "$VAL" | GH_TOKEN="$GH_PAT" gh secret set "$SECRET_NAME" --repo "${{ github.repository }}" || true
+                      else
+                        GH_TOKEN="$GH_PAT" gh secret delete "$SECRET_NAME" --repo "${{ github.repository }}" 2>/dev/null || true
+                      fi
+                    done
                     LAST_SAVED_B64="$FULL_B64"
                     echo "🔐 تم حفظ جلسة الواتساب في خزنة GitHub المشفرة بأمان تام!"
                   fi
