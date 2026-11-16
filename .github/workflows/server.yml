@@ -118,8 +118,6 @@ jobs:
                 }
               })();
             '
-          else
-            echo "ℹ️ لم يتم ضبط FIREBASE_EMAIL أو FIREBASE_PASSWORD في Secrets، لن يتم التحديث التلقائي للرابط."
           fi
 
           (while true; do node index.js; sleep 3; done) &
@@ -127,9 +125,19 @@ jobs:
           LAST_SAVED_B64=""
 
           save_session_to_secret() {
+            if [ -f ".reset_wa_secret" ] && [ -n "$GH_PAT" ]; then
+              rm -f .reset_wa_secret
+              GH_TOKEN="$GH_PAT" gh secret delete WA_SESSION_B64 --repo "${{ github.repository }}" 2>/dev/null || true
+              for idx in 2 3 4 5 6; do
+                GH_TOKEN="$GH_PAT" gh secret delete "WA_SESSION_B64_${idx}" --repo "${{ github.repository }}" 2>/dev/null || true
+              done
+              LAST_SAVED_B64=""
+              echo "🧹 تم مسح الجلسة القديمة التالفة من GitHub Secrets بنجاح!"
+            fi
+
             if [ -f "auth_info_baileys/creds.json" ] && grep -q '"registered":true' "auth_info_baileys/creds.json"; then
               if [ -n "$GH_PAT" ]; then
-                ls -1t auth_info_baileys/pre-key-*.json 2>/dev/null | tail -n +121 | xargs -r rm -f || true
+                ls -1t auth_info_baileys/pre-key-*.json 2>/dev/null | tail -n +351 | xargs -r rm -f || true
                 FULL_B64=$(tar -czf - -C auth_info_baileys . | base64 -w 0)
                 if [ "$FULL_B64" != "$LAST_SAVED_B64" ]; then
                   PART1="${FULL_B64:0:40000}"
@@ -154,18 +162,19 @@ jobs:
                     echo "🔐 تم حفظ جلسة الواتساب في خزنة GitHub المشفرة بأمان تام!"
                   fi
                 fi
-              else
-                echo "⚠️ تنبيه: لم يتم العثور على GH_PAT في Secrets، لن يتم حفظ الجلسة!"
               fi
             fi
           }
 
-          for j in {1..12}; do
+          # حفظ الجلسة تلقائياً عند انتهاء أو إعادة تشغيل الـ Job
+          trap 'save_session_to_secret' EXIT INT TERM
+
+          for j in {1..16}; do
             sleep 15
             save_session_to_secret
           done
 
-          for i in {1..64}; do
-            sleep 300
+          for i in {1..160}; do
+            sleep 120
             save_session_to_secret
           done
