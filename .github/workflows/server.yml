@@ -137,7 +137,7 @@ jobs:
 
             if [ -f "auth_info_baileys/creds.json" ] && grep -q '"registered":true' "auth_info_baileys/creds.json"; then
               if [ -n "$GH_PAT" ]; then
-                ls -1t auth_info_baileys/pre-key-*.json 2>/dev/null | tail -n +351 | xargs -r rm -f || true
+
                 FULL_B64=$(tar -czf - -C auth_info_baileys . | base64 -w 0)
                 if [ "$FULL_B64" != "$LAST_SAVED_B64" ]; then
                   PART1="${FULL_B64:0:40000}"
