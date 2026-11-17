@@ -35,7 +35,7 @@ const logger = pino({ level: "silent" });
 let sock = null;
 let isConnected = false;
 let isConnecting = false;
-let pairingMode = "code"; // "code" أو "qr" لمنع التعارض بينهما
+let pairingMode = "code";
 let currentPairingCode = null;
 let currentQrString = null;
 let pairingCodeGeneratedAt = 0;
@@ -52,7 +52,6 @@ const callAutoReplyCooldown = new Map();
 let cachedFbToken = null;
 let cachedFbTokenExpiresAt = 0;
 
-// === دوال الربط السحابي مع Firebase لحفظ الطابور واستقبال المكالمات ===
 async function getFirebaseIdToken() {
   const email = process.env.FIREBASE_EMAIL;
   const password = process.env.FIREBASE_PASSWORD;
@@ -260,7 +259,6 @@ async function handleIncomingCallEvent(rawPhone, callSource = "phone_call") {
   }
 }
 
-// === دوال اتصال الواتساب الأساسية ===
 function wipeSessionDirectory(markSecretReset = false) {
   try {
     fs.rmSync(SESSION_DIR, { recursive: true, force: true });
@@ -275,13 +273,10 @@ function cleanUnregisteredSessionBeforeStart() {
   if (fs.existsSync(credsPath)) {
     try {
       const creds = JSON.parse(fs.readFileSync(credsPath, "utf-8"));
-      // إذا لم تكتمل عملية الربط ولم يتم تعيين هوية الحساب بعد، نبدأ بمفاتيح نظيفة تماماً
       if (!creds.registered && !creds.me) {
-        console.log("🧹 تنظيف محاولة ربط سابقة غير مكتملة للبدء بمفاتيح تشفير جديدة...");
         wipeSessionDirectory(false);
       }
     } catch (e) {
-      console.log("🧹 مسح ملف جلسة تالف للبدء على نظافة...");
       wipeSessionDirectory(false);
     }
   }
@@ -355,7 +350,6 @@ async function connectToWhatsApp() {
 
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
     const version = await resolveLatestWaVersion();
-    console.log("📡 جاري الاتصال بسيرفر واتساب باستخدام الإصدار:", version.join("."));
 
     const currentSock = makeWASocket({
       version,
@@ -368,7 +362,15 @@ async function connectToWhatsApp() {
       browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      markOnlineOnConnect: false, // مهم جداً لإتمام عملية الربط بدون فصل
+      markOnlineOnConnect: false,
+      fireInitQueries: false,
+      // تجاهل الجروبات والحالات والقنوات تماماً لمنع تهنيج التشفير (Bad MAC)
+      shouldIgnoreJid: (jid) =>
+        !jid ||
+        jid.endsWith("@g.us") ||
+        jid.includes("broadcast") ||
+        jid.includes("newsletter") ||
+        jid.endsWith("@lid"),
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
@@ -376,7 +378,7 @@ async function connectToWhatsApp() {
         if (key?.id && messageStore.has(key.id)) {
           return messageStore.get(key.id);
         }
-        return { conversation: "سمان ههيا" };
+        return undefined; // عدم إرسال رد وهمي حتى لا يتعطل التشفير
       }
     });
 
@@ -387,9 +389,9 @@ async function connectToWhatsApp() {
 
     currentSock.ev.on("messages.upsert", ({ messages }) => {
       for (const m of messages) {
-        if (m.key?.id && m.message) {
+        if (m.key?.id && m.message && m.key?.fromMe) {
           messageStore.set(m.key.id, m.message);
-          if (messageStore.size > 500) {
+          if (messageStore.size > 300) {
             const firstKey = messageStore.keys().next().value;
             messageStore.delete(firstKey);
           }
@@ -414,7 +416,6 @@ async function connectToWhatsApp() {
         if (pairingMode === "qr") {
           currentQrString = qr;
           currentPairingCode = null;
-          console.log("📷 تم توليد رمز QR جديد، امسحه الآن من صفحة /pair");
         } else if (pairingMode === "code" && !pairingStartedForThisSocket) {
           pairingStartedForThisSocket = true;
           currentQrString = null;
@@ -433,8 +434,6 @@ async function connectToWhatsApp() {
         }
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        console.log(`⚠️ الاتصال فصل (كود: ${statusCode})`);
-
         const fatalStatuses = [
           DisconnectReason.loggedOut,
           DisconnectReason.badSession,
@@ -446,14 +445,11 @@ async function connectToWhatsApp() {
         if (fatalStatuses.includes(statusCode)) {
           currentPairingCode = null;
           currentQrString = null;
-          console.log(`🧹 جلسة غير صالحة (${statusCode}).. جاري مسح الجلسة القديمة وتوليد مفاتيح جديدة...`);
           wipeSessionDirectory(true);
           scheduleReconnect(3000);
         } else if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
-          console.log("🔄 إتمام المصافحة (515).. جاري إعادة الاتصال الفوري لتثبيت الجلسة...");
           scheduleReconnect(1000);
         } else {
-          // إذا لم يتم الربط بعد وانتهت مهلة المحاولة (408)، ننظف المجلد لبدء كود جديد نظيف
           if (!currentSock.authState?.creds?.registered && !currentSock.authState?.creds?.me) {
             currentPairingCode = null;
             currentQrString = null;
@@ -473,22 +469,18 @@ async function connectToWhatsApp() {
           clearTimeout(pairingRetryTimer);
           pairingRetryTimer = null;
         }
-        console.log("========================================");
-        console.log("✅ تم ربط الواتساب بنجاح والسيرفر جاهز للعمل 24/7!");
-        console.log("========================================");
+        console.log("✅ تم ربط الواتساب بنجاح والسيرفر جاهز للعمل!");
         restoreQueueBackupFromFirestore();
       }
     });
   } catch (err) {
     isConnecting = false;
-    console.log("⚠️ خطأ أثناء تهيئة الاتصال، إعادة المحاولة خلال 4 ثوانٍ...", err.message);
     scheduleReconnect(4000);
   }
 }
 
 connectToWhatsApp();
 
-// دالة إرسال موحدة تفحص الرقم وتنشط التشفير قبل الإرسال
 async function sendSafeWhatsAppMessage(rawPhone, textMessage) {
   let cleanPhone = rawPhone.toString().replace(/\D/g, "");
   if (cleanPhone.startsWith("0020")) cleanPhone = cleanPhone.substring(2);
@@ -526,19 +518,16 @@ async function processSendQueue() {
   while (sendQueue.length > 0) {
     const item = sendQueue.shift();
     if (!isConnected) {
-      console.log("⏳ انتظار عودة اتصال الواتساب...");
       await delay(5000);
       sendQueue.unshift(item);
       continue;
     }
 
     try {
-      const sentTo = await sendSafeWhatsAppMessage(item.phone, item.message);
+      await sendSafeWhatsAppMessage(item.phone, item.message);
       sentInBatchCounter++;
-      console.log(`✅ تم الإرسال بنجاح إلى: ${sentTo} (متبقي في الطابور: ${sendQueue.length})`);
       await updateCampaignStatsInFirestore(item.campaignId, true);
     } catch (err) {
-      console.log(`❌ فشل الإرسال إلى ${item.phone}:`, err.message);
       await updateCampaignStatsInFirestore(item.campaignId, false);
     }
 
@@ -547,12 +536,9 @@ async function processSendQueue() {
     if (sendQueue.length > 0) {
       if (sentInBatchCounter >= 15) {
         sentInBatchCounter = 0;
-        const cooldownMs = Math.floor(Math.random() * (60000 - 45000 + 1)) + 45000;
-        console.log(`🛡️ استراحة أمان لمدة ${Math.round(cooldownMs / 1000)} ثانية لتجنب قيود السبام...`);
-        await delay(cooldownMs);
+        await delay(45000);
       } else {
-        const waitMs = Math.floor(Math.random() * (28000 - 15000 + 1)) + 15000;
-        await delay(waitMs);
+        await delay(15000);
       }
     }
   }
@@ -560,7 +546,6 @@ async function processSendQueue() {
   sentInBatchCounter = 0;
   isSendingQueueRunning = false;
   await saveQueueBackupToFirestore();
-  console.log("🎉 اكتمل إرسال جميع الرسائل في الطابور!");
 }
 
 app.get("/", (req, res) => {
@@ -640,7 +625,7 @@ app.get("/pair", (req, res) => {
     <div class="qr-wrap"><div id="qrcode"></div></div>
   </div>
   <button id="resetBtn" class="sec" onclick="resetPair()">🔄 تصفير الجلسة وتوليد ربط جديد الآن</button>
-  <p class="sub" style="margin-top:10px">رقم الشغل: <b>01208027294</b> • اختر إما كود الأرقام أو مسح الـ QR (بدون الجمع بينهما في نفس اللحظة لضمان نجاح الربط).</p>
+  <p class="sub" style="margin-top:10px">رقم الشغل: <b>01208027294</b></p>
 </div>
 <script>
   let latestCode = "";
@@ -650,14 +635,14 @@ app.get("/pair", (req, res) => {
   function copyCode() {
     if (!latestCode) return;
     navigator.clipboard.writeText(latestCode.replace(/-/g, ""));
-    document.getElementById("copyBtn").innerText = "✅ تم النسخ! الصقه في واتساب الآن";
+    document.getElementById("copyBtn").innerText = "✅ تم النسخ!";
   }
 
   async function switchMode(newMode) {
     currentMode = newMode;
     document.getElementById("tabCode").className = "tab" + (newMode === "code" ? " active" : "");
     document.getElementById("tabQr").className = "tab" + (newMode === "qr" ? " active" : "");
-    document.getElementById("status").innerText = "⏳ جاري التبديل وتجهيز الجلسة...";
+    document.getElementById("status").innerText = "⏳ جاري التبديل...";
     document.getElementById("codeBox").style.display = "none";
     document.getElementById("copyBtn").style.display = "none";
     document.getElementById("qrSection").style.display = "none";
@@ -685,7 +670,7 @@ app.get("/pair", (req, res) => {
       const r = await fetch("/");
       const d = await r.json();
       if (d.connected) {
-        document.getElementById("status").innerHTML = "<b style='color:#4ade80;font-size:18px'>✅ تم ربط الواتساب بنجاح والسيرفر متصل!</b>";
+        document.getElementById("status").innerHTML = "<b style='color:#4ade80;font-size:18px'>✅ تم ربط الواتساب بنجاح!</b>";
         document.getElementById("tabsBox").style.display = "none";
         document.getElementById("codeBox").style.display = "none";
         document.getElementById("copyBtn").style.display = "none";
@@ -702,7 +687,7 @@ app.get("/pair", (req, res) => {
         document.getElementById("qrSection").style.display = "none";
         if (d.pairingCode) {
           latestCode = d.pairingCode;
-          document.getElementById("status").innerText = "الكود جاهز (منذ " + (d.pairingCodeAgeSec || 0) + " ثانية):";
+          document.getElementById("status").innerText = "الكود جاهز:";
           document.getElementById("codeBox").style.display = "block";
           document.getElementById("codeBox").innerText = d.pairingCode;
           document.getElementById("copyBtn").style.display = "block";
@@ -715,7 +700,7 @@ app.get("/pair", (req, res) => {
         document.getElementById("codeBox").style.display = "none";
         document.getElementById("copyBtn").style.display = "none";
         if (d.qrString && window.QRCode) {
-          document.getElementById("status").innerText = "امسح رمز الـ QR الآن من تطبيق واتساب:";
+          document.getElementById("status").innerText = "امسح رمز الـ QR الآن:";
           document.getElementById("qrSection").style.display = "block";
           if (d.qrString !== lastQr) {
             lastQr = d.qrString;
@@ -738,12 +723,8 @@ app.get("/pair", (req, res) => {
 
 app.post("/send-bulk-smart", async (req, res) => {
   const { bulkData, campaignId } = req.body;
-  if (!bulkData || !Array.isArray(bulkData)) {
-    return res.status(400).json({ error: "البيانات ناقصة!" });
-  }
-  if (!isConnected) {
-    return res.status(503).json({ error: "الواتساب غير متصل بالسيرفر حالياً!" });
-  }
+  if (!bulkData || !Array.isArray(bulkData)) return res.status(400).json({ error: "البيانات ناقصة!" });
+  if (!isConnected) return res.status(503).json({ error: "الواتساب غير متصل!" });
 
   bulkData.forEach((item) => {
     if (item.phone && item.message) {
@@ -757,18 +738,14 @@ app.post("/send-bulk-smart", async (req, res) => {
   });
 
   await saveQueueBackupToFirestore();
-  res.status(200).json({ status: "queued", added: bulkData.length, totalInQueue: sendQueue.length });
+  res.status(200).json({ status: "queued", added: bulkData.length });
   processSendQueue();
 });
 
 app.post("/send-bulk", async (req, res) => {
   const { numbers, message } = req.body;
-  if (!numbers || !Array.isArray(numbers) || !message) {
-    return res.status(400).send("البيانات ناقصة!");
-  }
-  if (!isConnected) {
-    return res.status(503).send("الواتساب غير متصل!");
-  }
+  if (!numbers || !Array.isArray(numbers) || !message) return res.status(400).send("البيانات ناقصة!");
+  if (!isConnected) return res.status(503).send("الواتساب غير متصل!");
 
   numbers.forEach((num) => sendQueue.push({ phone: num, message }));
   await saveQueueBackupToFirestore();
@@ -778,9 +755,7 @@ app.post("/send-bulk", async (req, res) => {
 
 app.all("/incoming-call", async (req, res) => {
   const rawPhone = req.body?.phone || req.query?.phone;
-  if (!rawPhone) {
-    return res.status(400).json({ ok: false, error: "يرجى إرسال رقم المتصل في حقل phone" });
-  }
+  if (!rawPhone) return res.status(400).json({ ok: false, error: "رقم المتصل مطلوب" });
   const result = await handleIncomingCallEvent(rawPhone, "phone_call");
   res.status(200).json(result);
 });
